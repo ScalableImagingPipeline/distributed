@@ -27,14 +27,14 @@ def memory_limit():
             pass
 
     # Check rlimit if available
-    try:
-        import resource
+    # try:
+    #     import resource
 
-        hard_limit = resource.getrlimit(resource.RLIMIT_RSS)[1]
-        if hard_limit > 0:
-            limit = min(limit, hard_limit)
-    except (ImportError, OSError):
-        pass
+    #     hard_limit = resource.getrlimit(resource.RLIMIT_RSS)[1]
+    #     if hard_limit > 0:
+    #         limit = min(limit, hard_limit)
+    # except (ImportError, OSError):
+    #     pass
 
     return limit
 
