@@ -1,4 +1,6 @@
 import asyncio
+import contextlib
+import functools
 import gc
 import inspect
 import logging
@@ -101,7 +103,7 @@ pytestmark = pytest.mark.ci1
 
 @gen_cluster(client=True)
 async def test_submit(c, s, a, b):
-    x = c.submit(inc, 10)
+    x = c.submit(inc, 10, key="x")
     assert not x.done()
 
     assert isinstance(x, Future)
@@ -111,7 +113,7 @@ async def test_submit(c, s, a, b):
     assert result == 11
     assert x.done()
 
-    y = c.submit(inc, 20)
+    y = c.submit(inc, 20, key="y")
     z = c.submit(add, x, y)
 
     result = await z
@@ -569,6 +571,17 @@ async def test_gather(c, s, a, b):
     assert result == [11]
     result = await c.gather({"x": x, "y": [y]})
     assert result == {"x": 11, "y": [12]}
+
+
+@gen_cluster(client=True)
+async def test_gather_mismatched_client(c, s, a, b):
+    c2 = await Client(s.address, asynchronous=True)
+
+    x = c.submit(inc, 10)
+    y = c2.submit(inc, 5)
+
+    with pytest.raises(ValueError, match="Futures created by another client"):
+        await c.gather([x, y])
 
 
 @gen_cluster(client=True)
@@ -3649,51 +3662,46 @@ def test_reconnect(loop):
         "9393",
         "--no-dashboard",
     ]
-    with popen(scheduler_cli) as s:
+    with popen(scheduler_cli):
         c = Client("127.0.0.1:9393", loop=loop)
-        start = time()
-        while len(c.nthreads()) != 1:
-            sleep(0.1)
-            assert time() < start + 3
-
+        c.wait_for_workers(1, timeout=10)
         x = c.submit(inc, 1)
-        assert x.result() == 2
+        assert x.result(timeout=10) == 2
 
     start = time()
     while c.status != "connecting":
-        assert time() < start + 5
+        assert time() < start + 10
         sleep(0.01)
 
     assert x.status == "cancelled"
     with pytest.raises(CancelledError):
-        x.result()
+        x.result(timeout=10)
 
-    with popen(scheduler_cli) as s:
+    with popen(scheduler_cli):
         start = time()
         while c.status != "running":
             sleep(0.1)
-            assert time() < start + 5
+            assert time() < start + 10
         start = time()
         while len(c.nthreads()) != 1:
             sleep(0.05)
-            assert time() < start + 15
+            assert time() < start + 10
 
         x = c.submit(inc, 1)
-        assert x.result() == 2
+        assert x.result(timeout=10) == 2
 
     start = time()
     while True:
+        assert time() < start + 10
         try:
-            x.result()
+            x.result(timeout=10)
             assert False
         except CommClosedError:
             continue
         except CancelledError:
             break
-        assert time() < start + 5
-        sleep(0.1)
 
-    sync(loop, w.close)
+    sync(loop, w.close, timeout=1)
     c.close()
 
 
@@ -4536,24 +4544,18 @@ async def test_scatter_dict_workers(c, s, a, b):
 
 
 @pytest.mark.slow
-@gen_test(timeout=180)
+@gen_test()
 async def test_client_timeout():
+    """`await Client(...)` keeps retrying for 10 seconds if it can't find the Scheduler
+    straight away
+    """
     c = Client("127.0.0.1:57484", asynchronous=True)
-
-    s = Scheduler(loop=c.loop, port=57484, dashboard_address=":0")
+    client_start_fut = asyncio.ensure_future(c)
     await asyncio.sleep(4)
-
-    try:
-        await s
-    except OSError:  # port in use
+    async with Scheduler(port=57484, dashboard_address=":0"):
+        await client_start_fut
+        assert await c.run_on_scheduler(lambda: 123) == 123
         await c.close()
-        return
-
-    try:
-        await c
-        await c.close()
-    finally:
-        await s.close()
 
 
 @gen_cluster(client=True)
@@ -5744,6 +5746,33 @@ async def test_scatter_error_cancel(c, s, a, b):
     assert y.status == "error"  # not cancelled
 
 
+@pytest.mark.parametrize("workers_arg", [False, True])
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("broadcast", [False, True, 10])
+@gen_cluster(client=True, nthreads=[("", 1)] * 10)
+async def test_scatter_and_replicate_avoid_paused_workers(
+    c, s, *workers, workers_arg, direct, broadcast
+):
+    paused_workers = [w for i, w in enumerate(workers) if i not in (3, 7)]
+    for w in paused_workers:
+        w.memory_pause_fraction = 1e-15
+    while any(s.workers[w.address].status != Status.paused for w in paused_workers):
+        await asyncio.sleep(0.01)
+
+    f = await c.scatter(
+        {"x": 1},
+        workers=[w.address for w in workers[1:-1]] if workers_arg else None,
+        broadcast=broadcast,
+        direct=direct,
+    )
+    if not broadcast:
+        await c.replicate(f, n=10)
+
+    expect = [i in (3, 7) for i in range(10)]
+    actual = [("x" in w.data) for w in workers]
+    assert actual == expect
+
+
 @pytest.mark.xfail(reason="GH#5409 Dask-Default-Threads are frequently detected")
 def test_no_threads_lingering():
     if threading.active_count() < 40:
@@ -6050,6 +6079,7 @@ async def test_futures_of_sorted(c, s, a, b):
         assert str(k) in str(f)
 
 
+@pytest.mark.flaky(reruns=10, reruns_delay=5)
 @gen_cluster(client=True, worker_kwargs={"profile_cycle_interval": "10ms"})
 async def test_profile_server(c, s, a, b):
     for i in range(5):
@@ -6859,7 +6889,8 @@ async def test_computation_object_code_client_compute(c, s, a, b):
 async def test_upload_directory(c, s, a, b, tmp_path):
     from dask.distributed import UploadDirectory
 
-    files = set(os.listdir())
+    # Be sure to exclude code coverage reports
+    files_start = {f for f in os.listdir() if not f.startswith(".coverage")}
 
     with open(tmp_path / "foo.py", "w") as f:
         f.write("x = 123")
@@ -6885,7 +6916,8 @@ async def test_upload_directory(c, s, a, b, tmp_path):
         results = await c.run(f)
         assert results[n.worker_address] == 123
 
-    assert files == set(os.listdir())  # no change
+    files_end = {f for f in os.listdir() if not f.startswith(".coverage")}
+    assert files_start == files_end  # no change
 
 
 @gen_cluster(client=True)
@@ -6912,6 +6944,16 @@ async def test_async_task(c, s, a, b):
     future = c.submit(f, 10)
     result = await future
     assert result == 11
+
+
+@gen_cluster(client=True)
+async def test_async_task_with_partial(c, s, a, b):
+    async def f(x, y):
+        return x + y + 1
+
+    future = c.submit(functools.partial(f, 1), 10)
+    result = await future
+    assert result == 12
 
 
 @gen_cluster(client=True, nthreads=[("", 1)])
@@ -7057,3 +7099,97 @@ def test_print_simple(capsys):
 
     out, err = capsys.readouterr()
     assert "Hello!:123" in out
+
+
+def _verify_cluster_dump(path, _format):
+    path = str(path)
+    if _format == "msgpack":
+        import gzip
+
+        import msgpack
+
+        path += ".msgpack.gz"
+
+        with gzip.open(path) as fd:
+            state = msgpack.unpack(fd)
+    else:
+        import yaml
+
+        path += ".yaml"
+        with open(path) as fd:
+            state = yaml.load(fd, Loader=yaml.Loader)
+
+    assert isinstance(state, dict)
+    assert "scheduler" in state
+    assert "workers" in state
+    assert "versions" in state
+
+
+@pytest.mark.parametrize("_format", ["msgpack", "json", "yaml"])
+def test_dump_cluster_state(c, s, a, b, tmp_path, _format):
+
+    if _format == "json":
+        ctx = pytest.raises(ValueError, match="Unsupported format")
+    else:
+        ctx = contextlib.nullcontext()
+
+    filename = tmp_path / "foo"
+    with ctx:
+        c.dump_cluster_state(
+            filename=filename,
+            format=_format,
+        )
+
+        _verify_cluster_dump(filename, _format)
+
+
+@pytest.mark.parametrize("_format", ["msgpack", "json", "yaml"])
+@gen_cluster(client=True)
+async def test_dump_cluster_state_async(c, s, a, b, tmp_path, _format):
+
+    if _format == "json":
+        ctx = pytest.raises(ValueError, match="Unsupported format")
+    else:
+        ctx = contextlib.nullcontext()
+
+    filename = tmp_path / "foo"
+    with ctx:
+        await c.dump_cluster_state(
+            filename=filename,
+            format=_format,
+        )
+
+        _verify_cluster_dump(filename, _format)
+
+
+@gen_cluster(client=True)
+async def test_dump_cluster_state_exclude(c, s, a, b, tmp_path):
+
+    futs = c.map(inc, range(10))
+    while len(s.tasks) != len(futs):
+        await asyncio.sleep(0.01)
+    exclude = [
+        # these are TaskState attributes
+        "_runspec",
+        "runspec",
+    ]
+    filename = tmp_path / "foo"
+    await c.dump_cluster_state(
+        filename=filename,
+        format="yaml",
+    )
+
+    with open(str(filename) + ".yaml") as fd:
+        import yaml
+
+        state = yaml.load(fd, Loader=yaml.Loader)
+
+    assert "workers" in state
+    assert len(state["workers"]) == len(s.workers)
+    assert "scheduler" in state
+    assert "tasks" in state["scheduler"]
+    tasks = state["scheduler"]["tasks"]
+    assert len(tasks) == len(futs)
+    for k, task_dump in tasks.items():
+        assert not any(blocked in task_dump for blocked in exclude)
+        assert k in s.tasks

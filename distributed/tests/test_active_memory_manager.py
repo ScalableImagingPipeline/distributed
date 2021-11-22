@@ -8,6 +8,7 @@ from distributed.active_memory_manager import (
     ActiveMemoryManagerExtension,
     ActiveMemoryManagerPolicy,
 )
+from distributed.core import Status
 from distributed.utils_test import gen_cluster, inc, slowinc
 
 NO_AMM_START = {"distributed.scheduler.active-memory-manager.start": False}
@@ -21,7 +22,7 @@ NO_AMM_START = {"distributed.scheduler.active-memory-manager.start": False}
     },
 )
 async def test_no_policies(c, s, a, b):
-    await c.scheduler.amm_run_once()
+    s.extensions["amm"].run_once()
 
 
 class DemoPolicy(ActiveMemoryManagerPolicy):
@@ -69,7 +70,7 @@ async def test_drop(c, s, *workers):
     futures = await c.scatter({"x": 123}, broadcast=True)
     assert len(s.tasks["x"].who_has) == 4
     # Also test the extension handler
-    await c.scheduler.amm_run_once()
+    s.extensions["amm"].run_once()
     while len(s.tasks["x"].who_has) > 1:
         await asyncio.sleep(0.01)
     # The last copy is never dropped even if the policy asks so
@@ -82,10 +83,12 @@ async def test_start_stop(c, s, a, b):
     x = c.submit(lambda: 123, key="x")
     await c.replicate(x, 2)
     assert len(s.tasks["x"].who_has) == 2
-    await c.scheduler.amm_start()
+    s.extensions["amm"].start()
     while len(s.tasks["x"].who_has) > 1:
         await asyncio.sleep(0.01)
-    await c.scheduler.amm_stop()
+    s.extensions["amm"].start()  # Double start is a no-op
+    s.extensions["amm"].stop()
+    s.extensions["amm"].stop()  # Double stop is a no-op
     # AMM is not running anymore
     await c.replicate(x, 2)
     await asyncio.sleep(0.2)
@@ -132,6 +135,9 @@ async def test_add_policy(c, s, a, b):
     while len(s.tasks["z"].who_has) == 2:
         await asyncio.sleep(0.01)
 
+    with pytest.raises(TypeError):
+        m3.add_policy("not a policy")
+
 
 @gen_cluster(client=True, config=demo_config("drop", key="x", start=False))
 async def test_multi_start(c, s, a, b):
@@ -146,9 +152,9 @@ async def test_multi_start(c, s, a, b):
     m2 = ActiveMemoryManagerExtension(s, {p2}, register=False, start=True, interval=0.1)
     m3 = ActiveMemoryManagerExtension(s, {p3}, register=False, start=True, interval=0.1)
 
-    assert not m1.started
-    assert m2.started
-    assert m3.started
+    assert not m1.running
+    assert m2.running
+    assert m3.running
 
     futures = await c.scatter({"x": 1, "y": 2, "z": 3}, broadcast=True)
 
@@ -175,6 +181,25 @@ async def test_not_registered(c, s, a, b):
 
     while len(s.tasks["x"].who_has) > 1:
         await asyncio.sleep(0.01)
+
+
+def test_client_proxy_sync(client):
+    assert not client.amm.running()
+    client.amm.start()
+    assert client.amm.running()
+    client.amm.stop()
+    assert not client.amm.running()
+    client.amm.run_once()
+
+
+@gen_cluster(client=True, config=NO_AMM_START)
+async def test_client_proxy_async(c, s, a, b):
+    assert not await c.amm.running()
+    await c.amm.start()
+    assert await c.amm.running()
+    await c.amm.stop()
+    assert not await c.amm.running()
+    await c.amm.run_once()
 
 
 @gen_cluster(client=True, config=demo_config("drop"))
@@ -209,7 +234,6 @@ async def test_drop_with_waiter(c, s, a, b):
     assert not y2.done()
 
 
-@pytest.mark.xfail(reason="distributed#5265")
 @gen_cluster(client=True, config=NO_AMM_START)
 async def test_double_drop(c, s, a, b):
     """An AMM drop policy runs once to drop one of the two replicas of a key.
@@ -329,44 +353,20 @@ async def test_drop_with_bad_candidates(c, s, a, b):
     assert s.tasks["x"].who_has == {ws0, ws1}
 
 
-class DropEverything(ActiveMemoryManagerPolicy):
-    """Inanely suggest to drop every single key in the cluster"""
+@gen_cluster(client=True, nthreads=[("", 1)] * 10, config=demo_config("drop", n=1))
+async def test_drop_prefers_paused_workers(c, s, *workers):
+    x = await c.scatter({"x": 1}, broadcast=True)
+    ts = s.tasks["x"]
+    assert len(ts.who_has) == 10
+    ws = s.workers[workers[3].address]
+    workers[3].memory_pause_fraction = 1e-15
+    while ws.status != Status.paused:
+        await asyncio.sleep(0.01)
 
-    def run(self):
-        for ts in self.manager.scheduler.tasks.values():
-            # Instead of yielding ("drop", ts, None) for each worker, which would result
-            # in semi-predictable output about which replica survives, randomly choose a
-            # different survivor at each AMM run.
-            candidates = list(ts.who_has)
-            random.shuffle(candidates)
-            for ws in candidates:
-                yield "drop", ts, {ws}
-
-
-@pytest.mark.xfail(reason="distributed#5046, distributed#5265")
-@pytest.mark.slow
-@gen_cluster(
-    client=True,
-    nthreads=[("", 1)] * 8,
-    Worker=Nanny,
-    config={
-        "distributed.scheduler.active-memory-manager.start": True,
-        "distributed.scheduler.active-memory-manager.interval": 0.1,
-        "distributed.scheduler.active-memory-manager.policies": [
-            {"class": "distributed.tests.test_active_memory_manager.DropEverything"},
-        ],
-    },
-)
-async def test_drop_stress(c, s, *nannies):
-    """A policy which suggests dropping everything won't break a running computation,
-    but only slow it down.
-    """
-    import dask.array as da
-
-    rng = da.random.RandomState(0)
-    a = rng.random((20, 20), chunks=(1, 1))
-    b = (a @ a.T).sum().round(3)
-    assert await c.compute(b) == 2134.398
+    s.extensions["amm"].run_once()
+    while len(ts.who_has) != 9:
+        await asyncio.sleep(0.01)
+    assert ws not in ts.who_has
 
 
 @gen_cluster(nthreads=[("", 1)] * 4, client=True, config=demo_config("replicate", n=2))
@@ -477,6 +477,32 @@ async def test_replicate_to_candidates_with_key(c, s, a, b):
     assert s.tasks["x"].who_has == {ws0}
 
 
+@gen_cluster(client=True, nthreads=[("", 1)] * 3, config=demo_config("replicate"))
+async def test_replicate_avoids_paused_workers_1(c, s, w0, w1, w2):
+    w1.memory_pause_fraction = 1e-15
+    while s.workers[w1.address].status != Status.paused:
+        await asyncio.sleep(0.01)
+
+    futures = await c.scatter({"x": 1}, workers=[w0.address])
+    s.extensions["amm"].run_once()
+    while "x" not in w2.data:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    assert "x" not in w1.data
+
+
+@gen_cluster(client=True, config=demo_config("replicate"))
+async def test_replicate_avoids_paused_workers_2(c, s, a, b):
+    b.memory_pause_fraction = 1e-15
+    while s.workers[b.address].status != Status.paused:
+        await asyncio.sleep(0.01)
+
+    futures = await c.scatter({"x": 1}, workers=[a.address])
+    s.extensions["amm"].run_once()
+    await asyncio.sleep(0.2)
+    assert "x" not in b.data
+
+
 @gen_cluster(
     nthreads=[("", 1)] * 4,
     client=True,
@@ -496,3 +522,81 @@ async def test_ReduceReplicas(c, s, *workers):
     s.extensions["amm"].run_once()
     while len(s.tasks["x"].who_has) > 1:
         await asyncio.sleep(0.01)
+
+
+class DropEverything(ActiveMemoryManagerPolicy):
+    """Inanely suggest to drop every single key in the cluster"""
+
+    def __init__(self):
+        self.i = 0
+
+    def run(self):
+        for ts in self.manager.scheduler.tasks.values():
+            # Instead of yielding ("drop", ts, None) for each worker, which would result
+            # in semi-predictable output about which replica survives, randomly choose a
+            # different survivor at each AMM run.
+            candidates = list(ts.who_has)
+            random.shuffle(candidates)
+            for ws in candidates:
+                yield "drop", ts, {ws}
+
+        # Stop running after ~2s
+        self.i += 1
+        if self.i == 20:
+            self.manager.policies.remove(self)
+
+
+async def _tensordot_stress(c):
+    da = pytest.importorskip("dask.array")
+
+    rng = da.random.RandomState(0)
+    a = rng.random((20, 20), chunks=(1, 1))
+    b = (a @ a.T).sum().round(3)
+    assert await c.compute(b) == 2134.398
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(reason="https://github.com/dask/distributed/issues/5371")
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)] * 4,
+    Worker=Nanny,
+    config={
+        "distributed.scheduler.active-memory-manager.start": True,
+        "distributed.scheduler.active-memory-manager.interval": 0.1,
+        "distributed.scheduler.active-memory-manager.policies": [
+            {"class": "distributed.tests.test_active_memory_manager.DropEverything"},
+        ],
+    },
+    timeout=120,
+)
+async def test_drop_stress(c, s, *nannies):
+    """A policy which suggests dropping everything won't break a running computation,
+    but only slow it down.
+
+    See also: test_ReduceReplicas_stress
+    """
+    await _tensordot_stress(c)
+
+
+@pytest.mark.slow
+@pytest.mark.xfail(reason="https://github.com/dask/distributed/issues/5371")
+@gen_cluster(
+    client=True,
+    nthreads=[("", 1)] * 4,
+    Worker=Nanny,
+    config={
+        "distributed.scheduler.active-memory-manager.start": True,
+        "distributed.scheduler.active-memory-manager.interval": 0.1,
+        "distributed.scheduler.active-memory-manager.policies": [
+            {"class": "distributed.active_memory_manager.ReduceReplicas"},
+        ],
+    },
+    timeout=120,
+)
+async def test_ReduceReplicas_stress(c, s, *nannies):
+    """Running ReduceReplicas compulsively won't break a running computation. Unlike
+    test_drop_stress above, this test does not stop running after a few seconds - the
+    policy must not disrupt the computation too much.
+    """
+    await _tensordot_stress(c)

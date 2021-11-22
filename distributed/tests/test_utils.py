@@ -1,5 +1,7 @@
 import array
 import asyncio
+import contextvars
+import functools
 import io
 import os
 import queue
@@ -553,6 +555,18 @@ async def test_offload():
     assert (await offload(lambda x, y: x + y, 1, y=2)) == 3
 
 
+@pytest.mark.asyncio
+async def test_offload_preserves_contextvars():
+    var = contextvars.ContextVar("var")
+
+    async def set_var(v: str):
+        var.set(v)
+        r = await offload(var.get)
+        assert r == v
+
+    await asyncio.gather(set_var("foo"), set_var("bar"))
+
+
 def test_serialize_for_cli_deprecated():
     with pytest.warns(FutureWarning, match="serialize_for_cli is deprecated"):
         from distributed.utils import serialize_for_cli
@@ -610,3 +624,12 @@ def test_tmpfile_deprecated():
 def test_iscoroutinefunction_unhashable_input():
     # Ensure iscoroutinefunction can handle unhashable callables
     assert not iscoroutinefunction(_UnhashableCallable())
+
+
+def test_iscoroutinefunction_nested_partial():
+    async def my_async_callable(x, y, z):
+        pass
+
+    assert iscoroutinefunction(
+        functools.partial(functools.partial(my_async_callable, 1), 2)
+    )

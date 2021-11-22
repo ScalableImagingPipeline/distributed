@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import asyncio
+import contextvars
 import functools
 import importlib
 import inspect
@@ -22,16 +25,20 @@ from contextlib import contextmanager, suppress
 from hashlib import md5
 from importlib.util import cache_from_source
 from time import sleep
+from typing import TYPE_CHECKING
 from typing import Any as AnyType
-from typing import Dict, List
+from typing import ClassVar, Container, Sequence, overload
 
 import click
 import tblib.pickling_support
 
+if TYPE_CHECKING:
+    from typing_extensions import Protocol
+
 try:
     import resource
 except ImportError:
-    resource = None
+    resource = None  # type: ignore
 
 import tlz as toolz
 from tornado import gen
@@ -43,7 +50,7 @@ from dask.utils import parse_timedelta as _parse_timedelta
 from dask.widgets import get_template
 
 try:
-    from tornado.ioloop import PollIOLoop
+    from tornado.ioloop import PollIOLoop  # type: ignore
 except ImportError:
     PollIOLoop = None  # dropped in tornado 6.0
 
@@ -345,7 +352,9 @@ class LoopRunner:
     """
 
     # All loops currently associated to loop runners
-    _all_loops = weakref.WeakKeyDictionary()
+    _all_loops: ClassVar[
+        weakref.WeakKeyDictionary[IOLoop, tuple[int, LoopRunner | None]]
+    ] = weakref.WeakKeyDictionary()
     _lock = threading.Lock()
 
     def __init__(self, loop=None, asynchronous=False):
@@ -602,7 +611,7 @@ def key_split(s):
         return "Other"
 
 
-def key_split_group(x):
+def key_split_group(x) -> str:
     """A more fine-grained version of key_split
 
     >>> key_split_group(('x-2', 1))
@@ -633,7 +642,7 @@ def key_split_group(x):
     elif typ is bytes:
         return key_split_group(x.decode())
     else:
-        return key_split(x)
+        return "Other"
 
 
 @contextmanager
@@ -980,7 +989,7 @@ def json_load_robust(fn, load=json.load):
 class DequeHandler(logging.Handler):
     """A logging.Handler that records records into a deque"""
 
-    _instances = weakref.WeakSet()
+    _instances: ClassVar[weakref.WeakSet[DequeHandler]] = weakref.WeakSet()
 
     def __init__(self, *args, n=10000, **kwargs):
         self.deque = deque(maxlen=n)
@@ -1038,15 +1047,15 @@ if not is_server_extension:
 
         # TODO: Use tornado's AnyThreadEventLoopPolicy, instead of class below,
         # once tornado > 6.0.3 is available.
-        if WINDOWS and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        if WINDOWS:
             # WindowsProactorEventLoopPolicy is not compatible with tornado 6
             # fallback to the pre-3.8 default of Selector
             # https://github.com/tornadoweb/tornado/issues/2608
-            BaseEventLoopPolicy = asyncio.WindowsSelectorEventLoopPolicy
+            BaseEventLoopPolicy = asyncio.WindowsSelectorEventLoopPolicy  # type: ignore
         else:
             BaseEventLoopPolicy = asyncio.DefaultEventLoopPolicy
 
-        class AnyThreadEventLoopPolicy(BaseEventLoopPolicy):
+        class AnyThreadEventLoopPolicy(BaseEventLoopPolicy):  # type: ignore
             def get_event_loop(self):
                 try:
                     return super().get_event_loop()
@@ -1119,6 +1128,10 @@ def color_of(x, palette=palette):
 
 
 def _iscoroutinefunction(f):
+    # Python < 3.8 does not support determining if `partial` objects wrap async funcs
+    if sys.version_info < (3, 8):
+        while isinstance(f, functools.partial):
+            f = f.func
     return inspect.iscoroutinefunction(f) or gen.is_coroutine_function(f)
 
 
@@ -1314,7 +1327,11 @@ def import_term(name: str):
 
 async def offload(fn, *args, **kwargs):
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_offload_executor, lambda: fn(*args, **kwargs))
+    # Retain context vars while deserializing; see https://bugs.python.org/issue34014
+    context = contextvars.copy_context()
+    return await loop.run_in_executor(
+        _offload_executor, lambda: context.run(fn, *args, **kwargs)
+    )
 
 
 class EmptyContext:
@@ -1353,7 +1370,7 @@ class LRU(UserDict):
         super().__setitem__(key, value)
 
 
-def clean_dashboard_address(addrs: AnyType, default_listen_ip: str = "") -> List[Dict]:
+def clean_dashboard_address(addrs: AnyType, default_listen_ip: str = "") -> list[dict]:
     """
     Examples
     --------
@@ -1432,3 +1449,97 @@ def __getattr__(name):
         return import_term(use_instead)
     else:
         raise AttributeError(f"module {__name__} has no attribute {name}")
+
+
+if TYPE_CHECKING:
+
+    class SupportsToDict(Protocol):
+        def _to_dict(
+            self, *, exclude: Container[str] | None = None, **kwargs
+        ) -> dict[str, AnyType]:
+            ...
+
+
+@overload
+def recursive_to_dict(
+    obj: SupportsToDict, exclude: Container[str] = None, seen: set[AnyType] = None
+) -> dict[str, AnyType]:
+    ...
+
+
+@overload
+def recursive_to_dict(
+    obj: Sequence, exclude: Container[str] = None, seen: set[AnyType] = None
+) -> Sequence:
+    ...
+
+
+@overload
+def recursive_to_dict(
+    obj: dict, exclude: Container[str] = None, seen: set[AnyType] = None
+) -> dict:
+    ...
+
+
+@overload
+def recursive_to_dict(
+    obj: None, exclude: Container[str] = None, seen: set[AnyType] = None
+) -> None:
+    ...
+
+
+def recursive_to_dict(obj, exclude=None, seen=None):
+    """
+    This is for debugging purposes only and calls ``_to_dict`` methods on ``obj`` or
+    it's elements recursively, if available. The output of this function is
+    intended to be json serializable.
+
+    Parameters
+    ----------
+    exclude:
+        A list of attribute names to be excluded from the dump.
+        This will be forwarded to the objects ``_to_dict`` methods and these methods
+        are required to ensure this.
+    seen:
+        Used internally to avoid infinite recursion. If an object has already
+        been encountered, it's representation will be generated instead of its
+        ``_to_dict``. This is necessary since we have multiple cyclic referencing
+        data structures.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    if seen is None:
+        seen = set()
+    if id(obj) in seen:
+        return repr(obj)
+    seen.add(id(obj))
+    if isinstance(obj, type):
+        return repr(obj)
+    if hasattr(obj, "_to_dict"):
+        return obj._to_dict(exclude=exclude)
+    if isinstance(obj, (deque, set)):
+        obj = tuple(obj)
+    if isinstance(obj, (list, tuple)):
+        return tuple(
+            recursive_to_dict(
+                el,
+                exclude=exclude,
+                seen=seen,
+            )
+            for el in obj
+        )
+    elif isinstance(obj, dict):
+        res = {}
+        for k, v in obj.items():
+            k = recursive_to_dict(k, exclude=exclude, seen=seen)
+            try:
+                hash(k)
+            except TypeError:
+                k = str(k)
+            v = recursive_to_dict(v, exclude=exclude, seen=seen)
+            res[k] = v
+        return res
+    else:
+        return repr(obj)

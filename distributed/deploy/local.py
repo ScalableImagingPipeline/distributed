@@ -1,8 +1,6 @@
-import atexit
 import logging
 import math
 import warnings
-import weakref
 
 import toolz
 
@@ -200,6 +198,7 @@ class LocalCluster(SpecCluster):
 
         worker_kwargs.update(
             {
+                "host": host,
                 "nthreads": threads_per_worker,
                 "services": worker_services,
                 "dashboard_address": worker_dashboard_address,
@@ -258,12 +257,3 @@ class LocalCluster(SpecCluster):
             cluster_status=cluster_status,
         )
         return super()._repr_html_(cluster_status=cluster_status)
-
-
-clusters_to_close = weakref.WeakSet()
-
-
-@atexit.register
-def close_clusters():
-    for cluster in list(clusters_to_close):
-        cluster.close(timeout=10)
